@@ -1,0 +1,441 @@
+---
+- name: Prepare nodes and install Kubernetes tools
+  hosts: k8s_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    dns_server: "192.168.1.170"
+    kubernetes_minor_version: "v1.36"
+
+    base_packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+      - gnupg
+      - lsb-release
+      - software-properties-common
+      - chrony
+      - containerd
+      - nfs-common
+
+    kubernetes_packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+      - cri-tools
+
+  tasks:
+    - name: "[STATUS] Step 1/18 — Start node preparation"
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Domain: {{ cluster_domain }}"
+          - "DNS server: {{ dns_server }}"
+          - "Kubernetes repo: {{ kubernetes_minor_version }}"
+
+    - name: "[CHECK] Check access to DNS server"
+      command: ping -c 2 {{ dns_server }}
+      changed_when: false
+
+    - name: "[CHECK] Check DNS resolution for cluster nodes"
+      command: getent hosts {{ item }}.{{ cluster_domain }}
+      loop: "{{ groups['k8s_nodes'] }}"
+      changed_when: false
+
+    - name: "[STATUS] Step 2/18 — Update apt cache"
+      debug:
+        msg: "Updating apt cache on {{ inventory_hostname }}"
+
+    - name: "[TASK] Update apt cache"
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: "[STATUS] Step 3/18 — Install base packages"
+      debug:
+        msg: "Installing base packages, containerd, chrony and nfs-common"
+
+    - name: "[TASK] Install base packages"
+      apt:
+        name: "{{ base_packages }}"
+        state: present
+
+    - name: "[CHECK] Check base packages"
+      shell: "dpkg -s {{ item }} >/dev/null 2>&1"
+      loop: "{{ base_packages }}"
+      changed_when: false
+
+    - name: "[STATUS] Step 4/18 — Set hostname"
+      debug:
+        msg: "Setting hostname to {{ inventory_hostname }}"
+
+    - name: "[TASK] Set hostname"
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: "[TASK] Configure /etc/hosts local hostname record"
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ inventory_hostname }}.{{ cluster_domain }} {{ inventory_hostname }}"
+        state: present
+
+    - name: "[CHECK] Check hostname"
+      command: hostname
+      register: hostname_check
+      changed_when: false
+
+    - name: "[ASSERT] Hostname must be correct"
+      assert:
+        that:
+          - hostname_check.stdout == inventory_hostname
+        fail_msg: "Hostname is incorrect on {{ inventory_hostname }}"
+        success_msg: "Hostname is correct on {{ inventory_hostname }}"
+
+    - name: "[STATUS] Step 5/18 — Disable swap"
+      debug:
+        msg: "Disabling swap on {{ inventory_hostname }}"
+
+    - name: "[TASK] Disable swap immediately"
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+
+    - name: "[TASK] Disable swap permanently in /etc/fstab"
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: "[CHECK] Check swap status"
+      command: swapon --show
+      register: swap_status
+      changed_when: false
+      failed_when: swap_status.stdout != ""
+
+    - name: "[STATUS] Step 6/18 — Configure kernel modules"
+      debug:
+        msg: "Configuring overlay and br_netfilter modules"
+
+    - name: "[TASK] Create Kubernetes modules config"
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[TASK] Load overlay module"
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: "[TASK] Load br_netfilter module"
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: "[CHECK] Check loaded kernel modules"
+      command: lsmod
+      register: lsmod_output
+      changed_when: false
+
+    - name: "[ASSERT] Required kernel modules must be loaded"
+      assert:
+        that:
+          - "'overlay' in lsmod_output.stdout"
+          - "'br_netfilter' in lsmod_output.stdout"
+        fail_msg: "Required kernel modules are not loaded"
+        success_msg: "Required kernel modules are loaded"
+
+    - name: "[STATUS] Step 7/18 — Configure sysctl"
+      debug:
+        msg: "Configuring sysctl parameters for Kubernetes networking"
+
+    - name: "[TASK] Configure sysctl for Kubernetes"
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[TASK] Apply sysctl settings"
+      command: sysctl --system
+      changed_when: false
+
+    - name: "[CHECK] Check IPv4 forwarding"
+      command: sysctl -n net.ipv4.ip_forward
+      register: ip_forward_status
+      changed_when: false
+
+    - name: "[CHECK] Check bridge iptables"
+      command: sysctl -n net.bridge.bridge-nf-call-iptables
+      register: bridge_iptables_status
+      changed_when: false
+
+    - name: "[ASSERT] Sysctl parameters must be correct"
+      assert:
+        that:
+          - ip_forward_status.stdout == "1"
+          - bridge_iptables_status.stdout == "1"
+        fail_msg: "Sysctl parameters are incorrect"
+        success_msg: "Sysctl parameters are correct"
+
+    - name: "[STATUS] Step 8/18 — Configure containerd"
+      debug:
+        msg: "Configuring containerd runtime"
+
+    - name: "[TASK] Create containerd config directory"
+      file:
+        path: /etc/containerd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "[TASK] Generate default containerd config"
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: "[TASK] Enable SystemdCgroup in containerd"
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: "[TASK] Restart and enable containerd"
+      systemd:
+        name: containerd
+        enabled: true
+        state: restarted
+
+    - name: "[CHECK] Check containerd status"
+      command: systemctl is-active containerd
+      register: containerd_status
+      changed_when: false
+
+    - name: "[ASSERT] Containerd must be active"
+      assert:
+        that:
+          - containerd_status.stdout == "active"
+        fail_msg: "containerd is not active"
+        success_msg: "containerd is active"
+
+    - name: "[CHECK] Check containerd SystemdCgroup"
+      command: grep "SystemdCgroup = true" /etc/containerd/config.toml
+      changed_when: false
+
+    - name: "[STATUS] Step 9/18 — Enable time synchronization"
+      debug:
+        msg: "Starting and enabling chrony"
+
+    - name: "[TASK] Enable and start chrony"
+      systemd:
+        name: chrony
+        enabled: true
+        state: started
+
+    - name: "[CHECK] Check chrony status"
+      command: systemctl is-active chrony
+      register: chrony_status
+      changed_when: false
+
+    - name: "[ASSERT] Chrony must be active"
+      assert:
+        that:
+          - chrony_status.stdout == "active"
+        fail_msg: "chrony is not active"
+        success_msg: "chrony is active"
+
+    - name: "[STATUS] Step 10/18 — Remove old or broken Kubernetes repo files"
+      debug:
+        msg: "Removing old Kubernetes APT key and repository files"
+
+    - name: "[TASK] Remove old Kubernetes APT key"
+      file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: absent
+
+    - name: "[TASK] Remove old Kubernetes APT repository"
+      file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+
+    - name: "[TASK] Remove temporary Kubernetes Release key"
+      file:
+        path: /tmp/kubernetes-release.key
+        state: absent
+
+    - name: "[TASK] Create APT keyrings directory"
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "[STATUS] Step 11/18 — Check external DNS"
+      debug:
+        msg: "Checking external DNS resolution for pkgs.k8s.io"
+
+    - name: "[CHECK] Check DNS resolution for pkgs.k8s.io"
+      command: getent hosts pkgs.k8s.io
+      changed_when: false
+
+    - name: "[STATUS] Step 12/18 — Add Kubernetes repository key"
+      debug:
+        msg: "Downloading Kubernetes Release.key for {{ kubernetes_minor_version }}"
+
+    - name: "[TASK] Download Kubernetes Release.key"
+      get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: "0644"
+
+    - name: "[TASK] Convert Kubernetes key to GPG keyring"
+      command: >
+        gpg --batch --yes --dearmor
+        -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        /tmp/kubernetes-release.key
+
+    - name: "[TASK] Set permissions for Kubernetes APT key"
+      file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[STATUS] Step 13/18 — Add Kubernetes APT repository"
+      debug:
+        msg: "Adding Kubernetes repository {{ kubernetes_minor_version }}"
+
+    - name: "[TASK] Configure Kubernetes APT repository"
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/ /
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[TASK] Update apt cache after adding Kubernetes repo"
+      apt:
+        update_cache: true
+
+    - name: "[STATUS] Step 14/18 — Install Kubernetes packages"
+      debug:
+        msg: "Installing kubeadm, kubelet, kubectl and cri-tools"
+
+    - name: "[TASK] Install Kubernetes packages"
+      apt:
+        name: "{{ kubernetes_packages }}"
+        state: present
+
+    - name: "[CHECK] Check installed Kubernetes packages"
+      command: dpkg -s {{ item }}
+      loop: "{{ kubernetes_packages }}"
+      changed_when: false
+
+    - name: "[STATUS] Step 15/18 — Hold Kubernetes package versions"
+      debug:
+        msg: "Holding kubelet, kubeadm, kubectl and cri-tools versions"
+
+    - name: "[TASK] Hold Kubernetes packages"
+      command: apt-mark hold {{ item }}
+      loop: "{{ kubernetes_packages }}"
+      changed_when: false
+
+    - name: "[CHECK] Check held packages"
+      shell: |
+        for pkg in kubelet kubeadm kubectl cri-tools; do
+          apt-mark showhold | grep -qx "$pkg"
+        done
+      changed_when: false
+
+    - name: "[STATUS] Step 16/18 — Configure crictl"
+      debug:
+        msg: "Creating /etc/crictl.yaml for containerd"
+
+    - name: "[TASK] Configure crictl"
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+          debug: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "[CHECK] Check crictl config"
+      command: cat /etc/crictl.yaml
+      register: crictl_config
+      changed_when: false
+
+    - name: "[ASSERT] crictl must use containerd socket"
+      assert:
+        that:
+          - "'unix:///run/containerd/containerd.sock' in crictl_config.stdout"
+        fail_msg: "crictl is not configured for containerd"
+        success_msg: "crictl is configured for containerd"
+
+    - name: "[CHECK] Check crictl connection to containerd"
+      command: crictl info
+      register: crictl_info
+      changed_when: false
+
+    - name: "[STATUS] Step 17/18 — Enable kubelet"
+      debug:
+        msg: "Enabling kubelet service"
+
+    - name: "[TASK] Enable kubelet"
+      systemd:
+        name: kubelet
+        enabled: true
+
+    - name: "[CHECK] Check kubeadm version"
+      command: kubeadm version -o short
+      register: kubeadm_version
+      changed_when: false
+
+    - name: "[CHECK] Check kubelet version"
+      command: kubelet --version
+      register: kubelet_version
+      changed_when: false
+
+    - name: "[CHECK] Check kubectl client version"
+      command: kubectl version --client=true
+      register: kubectl_version
+      changed_when: false
+
+    - name: "[CHECK] Check crictl version"
+      command: crictl --version
+      register: crictl_version
+      changed_when: false
+
+    - name: "[STATUS] Step 18/18 — Final report"
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Status: READY for kubeadm init/join"
+          - "Swap: disabled"
+          - "Containerd: active"
+          - "Chrony: active"
+          - "NFS client: installed"
+          - "IPv4 forwarding: enabled"
+          - "DNS: working"
+          - "{{ kubeadm_version.stdout }}"
+          - "{{ kubelet_version.stdout }}"
+          - "{{ kubectl_version.stdout }}"
+          - "{{ crictl_version.stdout }}"
+          - "crictl: configured and connected to containerd"
+          - "kubelet: enabled"
